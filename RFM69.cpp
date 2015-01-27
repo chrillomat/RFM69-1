@@ -30,7 +30,10 @@
 // **********************************************************************************
 #include <RFM69.h>
 #include <RFM69registers.h>
-#include <SPI.h>
+#include <wiringPiSPI.h>
+#include <stdio.h>
+#include <errno.h>
+#include <string.h>
 
 volatile uint8_t RFM69::DATA[RF69_MAX_DATA_LEN];
 volatile uint8_t RFM69::_mode;        // current transceiver state
@@ -87,9 +90,11 @@ bool RFM69::initialize(uint8_t freqBand, uint8_t nodeID, uint8_t networkID)
     {255, 0}
   };
 
-  digitalWrite(_slaveSelectPin, HIGH);
-  pinMode(_slaveSelectPin, OUTPUT);
-  SPI.begin();
+  // TODO: make channel configurable
+  _spi=wiringPiSPISetup(0,1000000);
+  if(_spi<0){
+    return false;
+  }
 
   do writeReg(REG_SYNCVALUE1, 0xAA); while (readReg(REG_SYNCVALUE1) != 0xAA);
   do writeReg(REG_SYNCVALUE1, 0x55); while (readReg(REG_SYNCVALUE1) != 0x55);
@@ -104,7 +109,7 @@ bool RFM69::initialize(uint8_t freqBand, uint8_t nodeID, uint8_t networkID)
   setHighPower(_isRFM69HW); // called regardless if it's a RFM69W or RFM69HW
   setMode(RF69_MODE_STANDBY);
   while ((readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY) == 0x00); // wait for ModeReady
-  attachInterrupt(_interruptNum, RFM69::isr0, RISING);
+  //attachInterrupt(_interruptNum, RFM69::isr0, RISING);
 
   selfPointer = this;
   _address = nodeID;
@@ -204,58 +209,12 @@ bool RFM69::canSend()
 void RFM69::send(uint8_t toAddress, const void* buffer, uint8_t bufferSize, bool requestACK)
 {
   writeReg(REG_PACKETCONFIG2, (readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART); // avoid RX deadlocks
-  uint32_t now = millis();
-  while (!canSend() && millis() - now < RF69_CSMA_LIMIT_MS) receiveDone();
+  // TODO: skip RF69_CSMA_LIMIT_MS?
+  //uint32_t now = millis();
+  //while (!canSend() && millis() - now < RF69_CSMA_LIMIT_MS) receiveDone();
   sendFrame(toAddress, buffer, bufferSize, requestACK, false);
 }
 
-// to increase the chance of getting a packet across, call this function instead of send
-// and it handles all the ACK requesting/retrying for you :)
-// The only twist is that you have to manually listen to ACK requests on the other side and send back the ACKs
-// The reason for the semi-automaton is that the lib is interrupt driven and
-// requires user action to read the received data and decide what to do with it
-// replies usually take only 5..8ms at 50kbps@915MHz
-bool RFM69::sendWithRetry(uint8_t toAddress, const void* buffer, uint8_t bufferSize, uint8_t retries, uint8_t retryWaitTime) {
-  uint32_t sentTime;
-  for (uint8_t i = 0; i <= retries; i++)
-  {
-    send(toAddress, buffer, bufferSize, true);
-    sentTime = millis();
-    while (millis() - sentTime < retryWaitTime)
-    {
-      if (ACKReceived(toAddress))
-      {
-        //Serial.print(" ~ms:"); Serial.print(millis() - sentTime);
-        return true;
-      }
-    }
-    //Serial.print(" RETRY#"); Serial.println(i + 1);
-  }
-  return false;
-}
-
-// should be polled immediately after sending a packet with ACK request
-bool RFM69::ACKReceived(uint8_t fromNodeID) {
-  if (receiveDone())
-    return (SENDERID == fromNodeID || fromNodeID == RF69_BROADCAST_ADDR) && ACK_RECEIVED;
-  return false;
-}
-
-// check whether an ACK was requested in the last received packet (non-broadcasted packet)
-bool RFM69::ACKRequested() {
-  return ACK_REQUESTED && (TARGETID != RF69_BROADCAST_ADDR);
-}
-
-// should be called immediately after reception in case sender wants ACK
-void RFM69::sendACK(const void* buffer, uint8_t bufferSize) {
-  uint8_t sender = SENDERID;
-  int16_t _RSSI = RSSI; // save payload received RSSI value
-  writeReg(REG_PACKETCONFIG2, (readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART); // avoid RX deadlocks
-  uint32_t now = millis();
-  while (!canSend() && millis() - now < RF69_CSMA_LIMIT_MS) receiveDone();
-  sendFrame(sender, buffer, bufferSize, false, true);
-  RSSI = _RSSI; // restore payload RSSI
-}
 
 void RFM69::sendFrame(uint8_t toAddress, const void* buffer, uint8_t bufferSize, bool requestACK, bool sendACK)
 {
@@ -263,68 +222,57 @@ void RFM69::sendFrame(uint8_t toAddress, const void* buffer, uint8_t bufferSize,
   while ((readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY) == 0x00); // wait for ModeReady
   writeReg(REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_00); // DIO0 is "Packet Sent"
   if (bufferSize > RF69_MAX_DATA_LEN) bufferSize = RF69_MAX_DATA_LEN;
-
   // write to FIFO
-  select();
+  /* TODO:
   SPI.transfer(REG_FIFO | 0x80);
   SPI.transfer(bufferSize + 3);
   SPI.transfer(toAddress);
   SPI.transfer(_address);
-
   // control byte
   if (sendACK)
     SPI.transfer(0x80);
   else if (requestACK)
     SPI.transfer(0x40);
   else SPI.transfer(0x00);
-
   for (uint8_t i = 0; i < bufferSize; i++)
     SPI.transfer(((uint8_t*) buffer)[i]);
-  unselect();
-
   // no need to wait for transmit mode to be ready since its handled by the radio
   setMode(RF69_MODE_TX);
   uint32_t txStart = millis();
   while (digitalRead(_interruptPin) == 0 && millis() - txStart < RF69_TX_LIMIT_MS); // wait for DIO0 to turn HIGH signalling transmission finish
+  */
   //while (readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PACKETSENT == 0x00); // wait for ModeReady
   setMode(RF69_MODE_STANDBY);
 }
 
 void RFM69::interruptHandler() {
-  //pinMode(4, OUTPUT);
-  //digitalWrite(4, 1);
   if (_mode == RF69_MODE_RX && (readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PAYLOADREADY))
   {
-    //RSSI = readRSSI();
     setMode(RF69_MODE_STANDBY);
-    select();
-    SPI.transfer(REG_FIFO & 0x7F);
-    PAYLOADLEN = SPI.transfer(0);
+    //SPI.transfer(REG_FIFO & 0x7F);
+    //PAYLOADLEN = SPI.transfer(0);
     PAYLOADLEN = PAYLOADLEN > 66 ? 66 : PAYLOADLEN; // precaution
-    TARGETID = SPI.transfer(0);
+    //TARGETID = SPI.transfer(0);
     if(!(_promiscuousMode || TARGETID == _address || TARGETID == RF69_BROADCAST_ADDR) // match this node's address, or broadcast address or anything in promiscuous mode
        || PAYLOADLEN < 3) // address situation could receive packets that are malformed and don't fit this libraries extra fields
     {
       PAYLOADLEN = 0;
-      unselect();
       receiveBegin();
-      //digitalWrite(4, 0);
       return;
     }
 
     DATALEN = PAYLOADLEN - 3;
-    SENDERID = SPI.transfer(0);
-    uint8_t CTLbyte = SPI.transfer(0);
+    //SENDERID = SPI.transfer(0);
+    //uint8_t CTLbyte = SPI.transfer(0);
 
-    ACK_RECEIVED = CTLbyte & 0x80; // extract ACK-received flag
-    ACK_REQUESTED = CTLbyte & 0x40; // extract ACK-requested flag
+    //ACK_RECEIVED = CTLbyte & 0x80; // extract ACK-received flag
+    //ACK_REQUESTED = CTLbyte & 0x40; // extract ACK-requested flag
 
-    for (uint8_t i = 0; i < DATALEN; i++)
-    {
-      DATA[i] = SPI.transfer(0);
-    }
+    //for (uint8_t i = 0; i < DATALEN; i++)
+    //{
+    //  DATA[i] = SPI.transfer(0);
+    // }
     if (DATALEN < RF69_MAX_DATA_LEN) DATA[DATALEN] = 0; // add null at end of string
-    unselect();
     setMode(RF69_MODE_RX);
   }
   RSSI = readRSSI();
@@ -350,7 +298,6 @@ void RFM69::receiveBegin() {
 bool RFM69::receiveDone() {
 //ATOMIC_BLOCK(ATOMIC_FORCEON)
 //{
-  noInterrupts(); // re-enabled in unselect() via setMode() or via receiveBegin()
   if (_mode == RF69_MODE_RX && PAYLOADLEN > 0)
   {
     setMode(RF69_MODE_STANDBY); // enables interrupts
@@ -358,7 +305,7 @@ bool RFM69::receiveDone() {
   }
   else if (_mode == RF69_MODE_RX) // already in RX no payload yet
   {
-    interrupts(); // explicitly re-enable interrupts
+    //interrupts(); // explicitly re-enable interrupts
     return false;
   }
   receiveBegin();
@@ -373,11 +320,9 @@ void RFM69::encrypt(const char* key) {
   setMode(RF69_MODE_STANDBY);
   if (key != 0)
   {
-    select();
-    SPI.transfer(REG_AESKEY1 | 0x80);
-    for (uint8_t i = 0; i < 16; i++)
-      SPI.transfer(key[i]);
-    unselect();
+    //SPI.transfer(REG_AESKEY1 | 0x80);
+    //for (uint8_t i = 0; i < 16; i++)
+    //  SPI.transfer(key[i]);
   }
   writeReg(REG_PACKETCONFIG2, (readReg(REG_PACKETCONFIG2) & 0xFE) | (key ? 1 : 0));
 }
@@ -397,41 +342,29 @@ int16_t RFM69::readRSSI(bool forceTrigger) {
 
 uint8_t RFM69::readReg(uint8_t addr)
 {
-  select();
-  SPI.transfer(addr & 0x7F);
-  uint8_t regval = SPI.transfer(0);
-  unselect();
-  return regval;
+  uint8_t buf[2];
+  int status;
+  buf[0]=addr & 0x7F;
+  buf[1]=0x00;
+  status=wiringPiSPIDataRW(0, buf, 2);
+  if(status<0)
+    {
+      printf("readReg error: %s\n",strerror(errno));
+    }
+  return buf[1];
 }
 
 void RFM69::writeReg(uint8_t addr, uint8_t value)
 {
-  select();
-  SPI.transfer(addr | 0x80);
-  SPI.transfer(value);
-  unselect();
-}
-
-// select the transceiver
-void RFM69::select() {
-  noInterrupts();
-  // save current SPI settings
-  _SPCR = SPCR;
-  _SPSR = SPSR;
-  // set RFM69 SPI settings
-  SPI.setDataMode(SPI_MODE0);
-  SPI.setBitOrder(MSBFIRST);
-  SPI.setClockDivider(SPI_CLOCK_DIV4); // decided to slow down from DIV2 after SPI stalling in some instances, especially visible on mega1284p when RFM69 and FLASH chip both present
-  digitalWrite(_slaveSelectPin, LOW);
-}
-
-// UNselect the transceiver chip
-void RFM69::unselect() {
-  digitalWrite(_slaveSelectPin, HIGH);
-  // restore SPI settings to what they were before talking to RFM69
-  SPCR = _SPCR;
-  SPSR = _SPSR;
-  interrupts();
+  uint8_t buf[2];
+  int status;
+  buf[0]=addr | 0x80;
+  buf[1]=value;
+  status=wiringPiSPIDataRW(0, buf, 2);
+  if(status<0)
+    {
+      printf("writeReg error: %s\n",strerror(errno));
+    }
 }
 
 // ON  = disable filtering to capture all frames on network
@@ -455,31 +388,18 @@ void RFM69::setHighPowerRegs(bool onOff) {
   writeReg(REG_TESTPA2, onOff ? 0x7C : 0x70);
 }
 
-void RFM69::setCS(uint8_t newSPISlaveSelect) {
-  _slaveSelectPin = newSPISlaveSelect;
-  digitalWrite(_slaveSelectPin, HIGH);
-  pinMode(_slaveSelectPin, OUTPUT);
-}
-
 // for debugging
 void RFM69::readAllRegs()
 {
   uint8_t regVal;
 
+  
   for (uint8_t regAddr = 1; regAddr <= 0x4F; regAddr++)
   {
-    select();
-    SPI.transfer(regAddr & 0x7F); // send address + r/w bit
-    regVal = SPI.transfer(0);
-    unselect();
+    regVal = readReg(regAddr);
 
-    Serial.print(regAddr, HEX);
-    Serial.print(" - ");
-    Serial.print(regVal,HEX);
-    Serial.print(" - ");
-    Serial.println(regVal,BIN);
+    printf("reg 0x%x: 0x%x\n",regAddr, regVal);
   }
-  unselect();
 }
 
 uint8_t RFM69::readTemperature(uint8_t calFactor) // returns centigrade
